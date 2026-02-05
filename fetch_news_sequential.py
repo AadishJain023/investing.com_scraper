@@ -3,7 +3,6 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 from lxml import html
 import pandas as pd
 import signal
-from collections import defaultdict
 
 BASE = "https://www.investing.com"
 CHROME_PATH = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
@@ -12,7 +11,7 @@ shutdown_flag = False
 
 def signal_handler(sig, frame):
     global shutdown_flag
-    print("\n\n⚠️  Shutdown signal received. Finishing current batch...")
+    print("\n\n⚠️  Shutdown signal received. Finishing current operation...")
     shutdown_flag = True
 
 signal.signal(signal.SIGINT, signal_handler)
@@ -71,7 +70,7 @@ async def get_article_links(page, url):
             clean.append((l, d))
 
         seen = {}
-        for l, d in clean :
+        for l, d in clean:
             seen[l] = d
 
         return list(seen.items())
@@ -82,138 +81,125 @@ async def get_article_links(page, url):
 # -------------------------------------------------
 # Extract article headline + body
 # -------------------------------------------------
-async def get_article_content(context, url, semaphore, timeout=25000):
-    async with semaphore:
-        page = None
+async def get_article_content(page, url, timeout=25000):
+    try:
+        # 1. Navigation with a more realistic wait
+        await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
+        
+        # 2. Critical: Wait for the article container to actually exist
         try:
-            page = await context.new_page()
-            
-            # 1. Navigation with a more realistic wait
-            await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
-            
-            # 2. Critical: Wait for the article container to actually exist
-            # This prevents '0/X articles' by ensuring the page isn't blank
-            try:
-                await page.wait_for_selector("h1, .articleHeader", timeout=10000)
-            except:
-                return None # Page failed to load or bot-blocked
+            await page.wait_for_selector("h1, .articleHeader", timeout=10000)
+        except:
+            return None  # Page failed to load or bot-blocked
 
-            # 3. Get the full HTML content
-            content = await page.content()
-            tree = html.fromstring(content)
+        # 3. Get the full HTML content
+        content = await page.content()
+        tree = html.fromstring(content)
 
-            # 4. Flexible Headline Extraction
-            headline_paths = [
-                "//h1/text()",
-                "//h1[contains(@class, 'articleHeader')]/text()",
-                "//h1[@id='articleTitle']/text()",
-                "//div[contains(@class,'article-header')]//h1/text()"
-            ]
-            
-            headline = ""
-            for path in headline_paths:
-                result = tree.xpath(path)
-                if result:
-                    headline = result[0].strip()
+        # 4. Flexible Headline Extraction
+        headline_paths = [
+            "//h1/text()",
+            "//h1[contains(@class, 'articleHeader')]/text()",
+            "//h1[@id='articleTitle']/text()",
+            "//div[contains(@class,'article-header')]//h1/text()"
+        ]
+        
+        headline = ""
+        for path in headline_paths:
+            result = tree.xpath(path)
+            if result:
+                headline = result[0].strip()
+                break
+
+        # 5. Flexible Body Extraction
+        body_containers = [
+            "//div[contains(@class, 'WYSIWYG')]",
+            "//div[@id='articleContent']",
+            "//div[contains(@class, 'articlePage')]",
+            "//div[@class='article-content']"
+        ]
+        
+        body_parts = []
+        for container_path in body_containers:
+            paragraphs = tree.xpath(f"{container_path}//p//text()")
+            if paragraphs:
+                body_parts = [p.strip() for p in paragraphs if len(p.strip()) > 10]
+                if body_parts:
                     break
 
-            # 5. Flexible Body Extraction (The "Missing Content" Fix)
-            # We look for the main article div first, then grab paragraphs inside it
-            body_containers = [
-                "//div[contains(@class, 'WYSIWYG')]",
-                "//div[@id='articleContent']",
-                "//div[contains(@class, 'articlePage')]",
-                "//div[@class='article-content']"
-            ]
-            
-            body_parts = []
-            for container_path in body_containers:
-                # Try to get paragraphs specifically inside these containers
-                paragraphs = tree.xpath(f"{container_path}//p//text()")
-                if paragraphs:
-                    body_parts = [p.strip() for p in paragraphs if len(p.strip()) > 10]
-                    if body_parts: break
+        body = " ".join(body_parts)
 
-            body = " ".join(body_parts)
+        # 6. Final Validation - check if it's actually an article
+        if headline and len(body) > 100:
+            return {
+                "article_url": url,
+                "headline": headline,
+                "body": body
+            }
+        return None
 
-            # 6. Final Validation - check if it's actually an article
-            if headline and len(body) > 100:
-                return {
-                    "article_url": url,
-                    "headline": headline,
-                    "body": body
-                }
-            return None
+    except Exception:
+        return None
 
-        except Exception:
-            return None
-        finally:
-            if page:
-                await page.close()
 
 # -------------------------------------------------
-# Worker: Processes a single page with parallel article extraction
+# Process a single page sequentially
 # -------------------------------------------------
-async def process_single_page(context, base_url, page_no, article_semaphore, skip_pro=True):
+async def process_single_page(page, base_url, page_no, skip_pro=True):
     page_url = build_news_page(base_url, page_no)
-    
-    list_page = await context.new_page()
     results = []
     
     try:
         # Get article links
-        link_date_pair = await get_article_links(list_page, page_url)
+        link_date_pair = await get_article_links(page, page_url)
         
         if not link_date_pair:
-            return results, 0, page_no
+            return results, 0
         
         # Filter out pro articles
         if skip_pro:
-            link_date_pair = [(l, d) for l,d in link_date_pair if "/news/pro/" not in l]
+            link_date_pair = [(l, d) for l, d in link_date_pair if "/news/pro/" not in l]
         
         if not link_date_pair:
-            return results, 0, page_no
+            return results, 0
         
-        # Extract all articles in parallel
-        tasks = [
-            get_article_content(context, article_url, article_semaphore)
-            for article_url, _ in link_date_pair
-        ]
-        
-        article_results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Collect successful extractions
-        for (article_url, article_date), article_data in zip(link_date_pair, article_results):
+        # Extract articles one by one (sequentially)
+        for article_url, article_date in link_date_pair:
+            if shutdown_flag:
+                break
+                
+            article_data = await get_article_content(page, article_url)
+            
             if article_data and isinstance(article_data, dict):
                 article_data["company_news_url"] = base_url
                 article_data["published_date"] = article_date
                 results.append(article_data)
+            
+            # Small delay between articles
+            await asyncio.sleep(0.3)
         
-        return results, len(link_date_pair), page_no
+        return results, len(link_date_pair)
     
-    finally:
-        await list_page.close()
+    except Exception as e:
+        print(f"  ⚠️  Error processing page {page_no}: {e}")
+        return results, 0
 
 
 # -------------------------------------------------
-# Main async runner - FIXED DUPLICATE PREVENTION
+# Main sequential runner
 # -------------------------------------------------
 async def run_async(
     csv_path, 
     max_pages=None, 
-    num_page_workers=2,
-    articles_per_page=4,
     skip_pro=True,
     save_interval=100
 ):
     """
-    Fixed hybrid parallel scraper with proper page tracking.
+    Sequential scraper - processes one page and one article at a time.
     
     Args:
         csv_path: Path to CSV with news URLs
         max_pages: Maximum pages to scrape per URL (None = unlimited)
-        num_page_workers: Number of pages to process simultaneously
-        articles_per_page: Concurrent article extractions per page
         skip_pro: Skip /news/pro/ articles
         save_interval: Save progress after this many articles
     """
@@ -222,21 +208,18 @@ async def run_async(
     df = pd.read_csv(csv_path)
     all_results = []
     
-    # ✅ Track processed articles globally to prevent duplicates
+    # Track processed articles globally to prevent duplicates
     seen_article_urls = set()
     
     unique_urls = df["news_url"].dropna().unique()
-    total_concurrency = num_page_workers * articles_per_page
     
     print(f"📋 Found {len(unique_urls)} unique URLs to crawl")
-    print(f"⚙️  Parallel Configuration:")
-    print(f"   • {num_page_workers} pages processed simultaneously")
-    print(f"   • {articles_per_page} articles per page extracted in parallel")
-    print(f"   • Total concurrency: {total_concurrency} operations")
+    print(f"⚙️  Sequential Processing (one article at a time)")
     print(f"   • Skip pro articles: {skip_pro}\n")
 
     browser = None
     context = None
+    page = None
     
     try:
         async with async_playwright() as p:
@@ -262,11 +245,13 @@ async def run_async(
                 viewport={"width": 1366, "height": 768}
             )
 
+            # Create a single page for warm session
             warm_page = await context.new_page()
             await warm_session(warm_page)
             await warm_page.close()
 
-            article_semaphore = asyncio.Semaphore(articles_per_page)
+            # Create a single page to reuse throughout
+            page = await context.new_page()
             total_articles = 0
 
             for idx, base_url in enumerate(unique_urls, 1):
@@ -284,75 +269,31 @@ async def run_async(
                 company_articles = 0
                 page_no = 1
                 
-                # ✅ Track which pages we've already processed for this company
-                processed_pages = set()
-                
                 while not shutdown_flag:
                     if max_pages is not None and page_no > max_pages:
                         print(f"  ✓ Reached max pages limit ({max_pages})")
                         break
                     
-                    # ✅ Create batch of page numbers that haven't been processed yet
-                    page_batch = []
-                    for p in range(page_no, page_no + num_page_workers):
-                        if p not in processed_pages:
-                            page_batch.append(p)
+                    # Process one page at a time
+                    page_results, num_links = await process_single_page(
+                        page, base_url, page_no, skip_pro
+                    )
                     
-                    if not page_batch:
-                        break
+                    # Filter out duplicate articles
+                    new_results = []
+                    for article_data in page_results:
+                        article_url = article_data["article_url"]
+                        if article_url not in seen_article_urls:
+                            seen_article_urls.add(article_url)
+                            new_results.append(article_data)
                     
-                    # ✅ Mark these pages as being processed
-                    for p in page_batch:
-                        processed_pages.add(p)
+                    if new_results:
+                        all_results.extend(new_results)
+                        company_articles += len(new_results)
+                        total_articles += len(new_results)
                     
-                    # Process pages in parallel
-                    tasks = [
-                        process_single_page(context, base_url, p, article_semaphore, skip_pro)
-                        for p in page_batch
-                    ]
-                    
-                    # ✅ Wait for ALL tasks to complete before continuing
-                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    batch_articles = 0
-                    batch_had_content = False
-                    batch_stats = []
-                    
-                    for result in batch_results:
-                        if isinstance(result, Exception):
-                            continue
-                        
-                        page_results, num_links, processed_page = result
-                        
-                        if num_links > 0:
-                            batch_had_content = True
-                        
-                        # ✅ Filter out duplicate articles
-                        new_results = []
-                        for article_data in page_results:
-                            article_url = article_data["article_url"]
-                            if article_url not in seen_article_urls:
-                                seen_article_urls.add(article_url)
-                                new_results.append(article_data)
-                        
-                        if new_results:
-                            all_results.extend(new_results)
-                            batch_articles += len(new_results)
-                            company_articles += len(new_results)
-                            total_articles += len(new_results)
-                        
-                        # Store stats for this page
-                        batch_stats.append({
-                            'page': processed_page,
-                            'extracted': len(new_results),
-                            'total': num_links
-                        })
-                    
-                    # ✅ Print results sorted by page number
-                    batch_stats.sort(key=lambda x: x['page'])
-                    for stat in batch_stats:
-                        if stat['total'] > 0:
-                            print(f"  ✓ Page {stat['page']}: {stat['extracted']}/{stat['total']} articles extracted")
+                    if num_links > 0:
+                        print(f"  ✓ Page {page_no}: {len(new_results)}/{num_links} articles extracted")
                     
                     # Auto-save progress
                     if total_articles > 0 and total_articles % save_interval == 0:
@@ -360,13 +301,13 @@ async def run_async(
                         temp_df.to_csv("news_sentiment_data_temp.csv", index=False)
                         print(f"  💾 Progress saved: {total_articles} total articles")
                     
-                    # If no content in this batch, stop
-                    if not batch_had_content:
+                    # If no links found, stop pagination
+                    if num_links == 0:
                         print(f"  ✓ No more articles found, pagination complete")
                         break
                     
-                    # ✅ Move to next batch AFTER current batch completes
-                    page_no += num_page_workers
+                    # Move to next page
+                    page_no += 1
                     await asyncio.sleep(0.5)
 
                 print(f"  ✅ Company total: {company_articles} unique articles\n")
@@ -378,6 +319,11 @@ async def run_async(
     
     finally:
         print("\n🧹 Cleaning up resources...")
+        if page:
+            try:
+                await page.close()
+            except:
+                pass
         if context:
             try:
                 await context.close()
@@ -402,8 +348,8 @@ async def run_async(
 # Entry point
 # -------------------------------------------------
 if __name__ == "__main__":
-    print("🚀 Starting HYBRID PARALLEL web scraper (FIXED)...")
-    print("   (Parallelizes pages AND articles with duplicate prevention)")
+    print("🚀 Starting SEQUENTIAL web scraper...")
+    print("   (Processes one page and one article at a time)")
     print("   Press Ctrl+C to stop gracefully\n")
     
     try:
@@ -411,15 +357,13 @@ if __name__ == "__main__":
             run_async(
                 "url_sample.csv", 
                 max_pages=None,          
-                num_page_workers=3,      
-                articles_per_page=8,     
                 skip_pro=True,        
                 save_interval=100     
             )
         )
         
         if len(df_news) > 0:
-            # ✅ Final deduplication check
+            # Final deduplication check
             df_news = df_news.drop_duplicates(subset=['article_url'], keep='first')
             
             df_news.to_csv("news_sentiment_data.csv", index=False)
