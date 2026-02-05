@@ -1,2 +1,2 @@
-*.csv
 .ipynb_checkpoints/Untitled-checkpoint.ipynb
+.news_sentiment_data_1.csv
